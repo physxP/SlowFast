@@ -8,9 +8,9 @@ import random
 from itertools import chain as chain
 import torch
 import torch.utils.data
-from fvcore.common.file_io import PathManager
 
 import slowfast.utils.logging as logging
+from slowfast.utils.env import pathmgr
 
 from . import utils as utils
 from .build import DATASET_REGISTRY
@@ -70,12 +70,22 @@ class Ssv2(torch.utils.data.Dataset):
         logger.info("Constructing Something-Something V2 {}...".format(mode))
         self._construct_loader()
 
+        self.aug = False
+        self.rand_erase = False
+        self.use_temporal_gradient = False
+        self.temporal_gradient_rate = 0.0
+
+        if self.mode == "train" and self.cfg.AUG.ENABLE:
+            self.aug = True
+            if self.cfg.AUG.RE_PROB > 0:
+                self.rand_erase = True
+
     def _construct_loader(self):
         """
         Construct the video loader.
         """
         # Loading label names.
-        with PathManager.open(
+        with pathmgr.open(
             os.path.join(
                 self.cfg.DATA.PATH_TO_DATA_DIR,
                 "something-something-v2-labels.json",
@@ -91,7 +101,7 @@ class Ssv2(torch.utils.data.Dataset):
                 "train" if self.mode == "train" else "validation"
             ),
         )
-        with PathManager.open(label_file, "r") as f:
+        with pathmgr.open(label_file, "r") as f:
             label_json = json.load(f)
 
         self._video_names = []
@@ -109,7 +119,7 @@ class Ssv2(torch.utils.data.Dataset):
             self.cfg.DATA.PATH_TO_DATA_DIR,
             "{}.csv".format("train" if self.mode == "train" else "val"),
         )
-        assert PathManager.exists(path_to_file), "{} dir not found".format(
+        assert pathmgr.exists(path_to_file), "{} dir not found".format(
             path_to_file
         )
 
@@ -156,6 +166,29 @@ class Ssv2(torch.utils.data.Dataset):
             )
         )
 
+    def get_seq_frames(self, index):
+        """
+        Given the video index, return the list of sampled frame indexes.
+        Args:
+            index (int): the video index.
+        Returns:
+            seq (list): the indexes of frames of sampled from the video.
+        """
+        num_frames = self.cfg.DATA.NUM_FRAMES
+        video_length = len(self._path_to_videos[index])
+
+        seg_size = float(video_length - 1) / num_frames
+        seq = []
+        for i in range(num_frames):
+            start = int(np.round(seg_size * i))
+            end = int(np.round(seg_size * (i + 1)))
+            if self.mode == "train":
+                seq.append(random.randint(start, end))
+            else:
+                seq.append((start + end) // 2)
+
+        return seq
+
     def __getitem__(self, index):
         """
         Given the video index, return the list of frames, label, and video
@@ -171,7 +204,9 @@ class Ssv2(torch.utils.data.Dataset):
         short_cycle_idx = None
         # When short cycle is used, input index is a tupple.
         if isinstance(index, tuple):
-            index, short_cycle_idx = index
+            index, self._num_yielded = index
+            if self.cfg.MULTIGRID.SHORT_CYCLE:
+                index, short_cycle_idx = index
 
         if self.mode in ["train", "val"]:
             # -1 indicates random sampling.
@@ -215,18 +250,7 @@ class Ssv2(torch.utils.data.Dataset):
 
         label = self._labels[index]
 
-        num_frames = self.cfg.DATA.NUM_FRAMES
-        video_length = len(self._path_to_videos[index])
-
-        seg_size = float(video_length - 1) / num_frames
-        seq = []
-        for i in range(num_frames):
-            start = int(np.round(seg_size * i))
-            end = int(np.round(seg_size * (i + 1)))
-            if self.mode == "train":
-                seq.append(random.randint(start, end))
-            else:
-                seq.append((start + end) // 2)
+        seq = self.get_seq_frames(index)
 
         frames = torch.as_tensor(
             utils.retry_load_images(
@@ -235,27 +259,70 @@ class Ssv2(torch.utils.data.Dataset):
             )
         )
 
-        # Perform color normalization.
-        frames = utils.tensor_normalize(
-            frames, self.cfg.DATA.MEAN, self.cfg.DATA.STD
-        )
+        if self.aug:
+            if self.cfg.AUG.NUM_SAMPLE > 1:
 
-        # T H W C -> C T H W.
-        frames = frames.permute(3, 0, 1, 2)
-        # Perform data augmentation.
-        frames = utils.spatial_sampling(
-            frames,
-            spatial_idx=spatial_sample_index,
-            min_scale=min_scale,
-            max_scale=max_scale,
-            crop_size=crop_size,
-            random_horizontal_flip=self.cfg.DATA.RANDOM_FLIP,
-            inverse_uniform_sampling=self.cfg.DATA.INV_UNIFORM_SAMPLE,
-        )
+                frame_list = []
+                label_list = []
+                index_list = []
+                for _ in range(self.cfg.AUG.NUM_SAMPLE):
+                    new_frames = utils.aug_frame(
+                        self.cfg,
+                        self.mode,
+                        self.rand_erase,
+                        frames,
+                        spatial_sample_index,
+                        min_scale,
+                        max_scale,
+                        crop_size,
+                    )
+                    new_frames = utils.pack_pathway_output(self.cfg, new_frames)
+                    frame_list.append(new_frames)
+                    label_list.append(label)
+                    index_list.append(index)
+                return frame_list, label_list, index_list, [0] * self.cfg.AUG.NUM_SAMPLE, {}
+
+            else:
+                frames = utils.aug_frame(
+                    self.cfg,
+                    self.mode,
+                    self.rand_erase,
+                    frames,
+                    spatial_sample_index,
+                    min_scale,
+                    max_scale,
+                    crop_size,
+                )
+        else:
+            # Perform color normalization.
+            frames = utils.tensor_normalize(
+                frames, self.cfg.DATA.MEAN, self.cfg.DATA.STD
+            )
+
+            # T H W C -> C T H W.
+            frames = frames.permute(3, 0, 1, 2)
+            # Perform data augmentation.
+            frames = utils.spatial_sampling(
+                frames,
+                spatial_idx=spatial_sample_index,
+                min_scale=min_scale,
+                max_scale=max_scale,
+                crop_size=crop_size,
+                random_horizontal_flip=self.cfg.DATA.RANDOM_FLIP,
+                inverse_uniform_sampling=self.cfg.DATA.INV_UNIFORM_SAMPLE,
+            )
         frames = utils.pack_pathway_output(self.cfg, frames)
-        return frames, label, index, {}
+        return frames, label, index, 0, {}
 
     def __len__(self):
+        """
+        Returns:
+            (int): the number of videos in the dataset.
+        """
+        return self.num_videos
+
+    @property
+    def num_videos(self):
         """
         Returns:
             (int): the number of videos in the dataset.
